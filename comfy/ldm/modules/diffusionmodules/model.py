@@ -1,11 +1,15 @@
 # pytorch_diffusion + derived encoder decoder
+import json
+import logging
 import math
+import time
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import logging
 
 from comfy import model_management
+from comfy.internal_logging import detail
 import comfy.ops
 ops = comfy.ops.disable_weight_init
 
@@ -270,24 +274,119 @@ def slice_attention(q, k, v):
 
     return r1
 
+def slice_attention_bhsd(q, k, v):
+    out = torch.empty_like(q)
+    scale = int(q.shape[-1])**-0.5
+    mem_free_total = model_management.get_free_memory(q.device)
+    mem_required = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size() * (3 if q.element_size() == 2 else 2.5)
+    steps = max(1, 2**math.ceil(math.log(mem_required / mem_free_total, 2))) if mem_required > mem_free_total else 1
+
+    while True:
+        try:
+            slice_size = q.shape[1] // steps if q.shape[1] % steps == 0 else q.shape[1]
+            for start in range(0, q.shape[1], slice_size):
+                end = start + slice_size
+                weights = torch.bmm(q[:, start:end], k.transpose(1, 2)) * scale
+                out[:, start:end] = torch.bmm(torch.nn.functional.softmax(weights, dim=2), v)
+            return out
+        except Exception as e:
+            model_management.raise_non_oom(e)
+            model_management.soft_empty_cache(True)
+            steps *= 2
+            if steps > 128:
+                raise
+            logging.warning("out of memory error, increasing steps and trying again {}".format(steps))
+
+
+def _vae_attention_tensor_info(tensor):
+    return {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "strides": list(tensor.stride())}
+
+
+def _vae_attention_eligibility(q, k, v):
+    params = torch.backends.cuda.SDPAParams(q, k, v, None, 0.0, False, False)
+    return {
+        "flash_eligible": torch.backends.cuda.can_use_flash_attention(params),
+        "efficient_eligible": torch.backends.cuda.can_use_efficient_attention(params),
+    }
+
+
+def _vae_attention_diagnostic(event):
+    if model_management.vae_attention_diagnostics():
+        detail("VAE_BENCH %s", json.dumps(event, separators=(",", ":"), allow_nan=False))
+
+
+def _vae_exception_category(exception):
+    if model_management.is_oom(exception):
+        return "oom"
+    message = str(exception).lower()
+    if isinstance(exception, NotImplementedError) or "not supported" in message or "unsupported" in message or "no available kernel" in message or "no viable backend" in message:
+        return "unsupported"
+    return "kernel_error"
+
+
+_VAE_SDPA_BACKENDS = {
+    "flash": torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+    "efficient": torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+    "math": torch.nn.attention.SDPBackend.MATH,
+}
+
+
+def _vae_attention_start(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
+def _vae_attention_exception(event, started, device, exception):
+    if device.type == "cuda":
+        try:
+            torch.cuda.synchronize(device)
+        except Exception as deferred:
+            event["deferred_exception"] = {"type": type(deferred).__name__, "message": str(deferred), "category": _vae_exception_category(deferred)}
+        event["allocator_peak_observed"] = torch.cuda.max_memory_allocated(device)
+    else:
+        event["allocator_peak_observed"] = 0
+    event["elapsed_ms"] = (time.perf_counter() - started) * 1000
+    event["exception"] = {"type": type(exception).__name__, "message": str(exception), "category": _vae_exception_category(exception)}
+    _vae_attention_diagnostic(event)
+
+
+def _vae_attention_finish(event, started, output):
+    if output.device.type == "cuda":
+        torch.cuda.synchronize(output.device)
+        event["allocator_peak_observed"] = torch.cuda.max_memory_allocated(output.device)
+    else:
+        event["allocator_peak_observed"] = 0
+    event["elapsed_ms"] = (time.perf_counter() - started) * 1000
+    event["output"] = {"shape": list(output.shape), "dtype": str(output.dtype), "numel": output.numel()}
+    _vae_attention_diagnostic(event)
+
+
 def normal_attention(q, k, v):
-    # compute attention
     orig_shape = q.shape
     b = orig_shape[0]
     c = orig_shape[1]
 
-    q = q.reshape(b, c, -1)
-    q = q.permute(0, 2, 1)   # b,hw,c
-    k = k.reshape(b, c, -1) # b,c,hw
+    q = q.reshape(b, c, -1).permute(0, 2, 1)
+    k = k.reshape(b, c, -1)
     v = v.reshape(b, c, -1)
+    diagnostics = model_management.vae_attention_diagnostics()
+    if diagnostics:
+        event = {"type": "attention", "requested_mode": model_management.vae_attention_backend(), "backend": "split", "q": _vae_attention_tensor_info(q), "k": _vae_attention_tensor_info(k), "v": _vae_attention_tensor_info(v), "fallback": False}
+        event.update(_vae_attention_eligibility(q.unsqueeze(1), k.transpose(1, 2).unsqueeze(1), v.transpose(1, 2).unsqueeze(1)))
+        started = _vae_attention_start(q.device)
 
-    r1 = slice_attention(q, k, v)
-    h_ = r1.reshape(orig_shape)
-    del r1
-    return h_
+    try:
+        out = slice_attention(q, k, v).reshape(orig_shape)
+    except Exception as e:
+        if diagnostics:
+            _vae_attention_exception(event, started, q.device, e)
+        raise
+    if diagnostics:
+        _vae_attention_finish(event, started, out)
+    return out
 
 def xformers_attention(q, k, v):
-    # compute attention
     orig_shape = q.shape
     B = orig_shape[0]
     C = orig_shape[1]
@@ -295,16 +394,25 @@ def xformers_attention(q, k, v):
         lambda t: t.view(B, C, -1).transpose(1, 2).contiguous(),
         (q, k, v),
     )
+    diagnostics = model_management.vae_attention_diagnostics()
+    if diagnostics:
+        event = {"type": "attention", "requested_mode": model_management.vae_attention_backend(), "backend": "xformers", "q": _vae_attention_tensor_info(q), "k": _vae_attention_tensor_info(k), "v": _vae_attention_tensor_info(v), "fallback": False}
+        event.update(_vae_attention_eligibility(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)))
+        started = _vae_attention_start(q.device)
 
     try:
         out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None)
         out = out.transpose(1, 2).reshape(orig_shape)
-    except NotImplementedError:
+    except NotImplementedError as e:
+        if diagnostics:
+            event["exception"] = {"type": type(e).__name__, "message": str(e), "category": _vae_exception_category(e)}
+            event["fallback"] = "split"
         out = slice_attention(q.view(B, -1, C), k.view(B, -1, C).transpose(1, 2), v.view(B, -1, C).transpose(1, 2)).reshape(orig_shape)
+    if diagnostics:
+        _vae_attention_finish(event, started, out)
     return out
 
-def pytorch_attention(q, k, v):
-    # compute attention
+def _pytorch_attention(q, k, v, backend=None):
     orig_shape = q.shape
     B = orig_shape[0]
     C = orig_shape[1]
@@ -313,21 +421,113 @@ def pytorch_attention(q, k, v):
         lambda t: t.view(B, 1, C, -1).transpose(2, 3).contiguous(),
         (q, k, v),
     )
+    diagnostics = model_management.vae_attention_diagnostics()
+    if diagnostics:
+        event = {"type": "attention", "requested_mode": model_management.vae_attention_backend(), "backend": backend or "automatic-sdpa", "q": _vae_attention_tensor_info(q), "k": _vae_attention_tensor_info(k), "v": _vae_attention_tensor_info(v), "fallback": False}
+        event.update(_vae_attention_eligibility(q, k, v))
+        started = _vae_attention_start(q.device)
 
     try:
-        out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        if backend is None:
+            out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        elif backend == "default-sdpa":
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        else:
+            with torch.nn.attention.sdpa_kernel(_VAE_SDPA_BACKENDS[backend]):
+                out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
         out = out.transpose(2, 3).reshape(orig_shape)
     except Exception as e:
-        model_management.raise_non_oom(e)
+        if backend is not None:
+            if diagnostics:
+                _vae_attention_exception(event, started, q.device, e)
+            raise
+        try:
+            model_management.raise_non_oom(e)
+        except Exception:
+            if diagnostics:
+                _vae_attention_exception(event, started, q.device, e)
+            raise
+        if diagnostics:
+            event["exception"] = {"type": type(e).__name__, "message": str(e), "category": _vae_exception_category(e)}
         logging.warning("scaled_dot_product_attention OOMed: switched to slice attention")
         oom_fallback = True
     if oom_fallback:
+        if diagnostics:
+            event["fallback"] = "split"
         out = slice_attention(q.view(B, -1, C), k.view(B, -1, C).transpose(1, 2), v.view(B, -1, C).transpose(1, 2)).reshape(orig_shape)
+    if diagnostics:
+        _vae_attention_finish(event, started, out)
+    return out
+
+
+def pytorch_attention(q, k, v):
+    return _pytorch_attention(q, k, v)
+
+
+def pytorch_attention_default(q, k, v):
+    return _pytorch_attention(q, k, v, "default-sdpa")
+
+
+def pytorch_attention_flash(q, k, v):
+    return _pytorch_attention(q, k, v, "flash")
+
+
+def pytorch_attention_efficient(q, k, v):
+    return _pytorch_attention(q, k, v, "efficient")
+
+
+def pytorch_attention_math(q, k, v):
+    return _pytorch_attention(q, k, v, "math")
+
+
+def vae_attention_bhsd(q, k, v, backend):
+    """VAE attention for tensors laid out as [batch, heads, sequence, dim]."""
+    diagnostics = model_management.vae_attention_diagnostics()
+    if diagnostics:
+        event = {"type": "attention", "requested_mode": model_management.vae_attention_backend(), "backend": backend, "q": _vae_attention_tensor_info(q), "k": _vae_attention_tensor_info(k), "v": _vae_attention_tensor_info(v), "fallback": False}
+        event.update(_vae_attention_eligibility(q, k, v))
+        started = _vae_attention_start(q.device)
+
+    try:
+        if backend == "split":
+            batch, heads, sequence, dim = q.shape
+            out = slice_attention_bhsd(
+                q.reshape(batch * heads, sequence, dim),
+                k.reshape(batch * heads, sequence, dim),
+                v.reshape(batch * heads, sequence, dim),
+            ).reshape(batch, heads, sequence, dim)
+        elif backend == "default-sdpa":
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        else:
+            with torch.nn.attention.sdpa_kernel(_VAE_SDPA_BACKENDS[backend]):
+                out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+    except Exception as e:
+        if diagnostics:
+            _vae_attention_exception(event, started, q.device, e)
+        raise
+    if diagnostics:
+        _vae_attention_finish(event, started, out)
     return out
 
 
 def vae_attention():
-    if model_management.xformers_enabled_vae():
+    backend = model_management.vae_attention_backend()
+    if backend == "split":
+        logging.info("Using split attention in VAE")
+        return normal_attention
+    elif backend == "default-sdpa":
+        logging.info("Using default pytorch attention in VAE")
+        return pytorch_attention_default
+    elif backend == "flash":
+        logging.info("Using forced flash attention in VAE")
+        return pytorch_attention_flash
+    elif backend == "efficient":
+        logging.info("Using forced efficient attention in VAE")
+        return pytorch_attention_efficient
+    elif backend == "math":
+        logging.info("Using forced math attention in VAE")
+        return pytorch_attention_math
+    elif model_management.xformers_enabled_vae():
         logging.info("Using xformers attention in VAE")
         return xformers_attention
     elif model_management.pytorch_attention_enabled_vae():

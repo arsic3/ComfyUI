@@ -1,7 +1,10 @@
+import functools
 import json
+import logging
+import math
+import time
 import torch
 from enum import Enum
-import logging
 
 from comfy import model_management
 from comfy.utils import ProgressBar
@@ -37,6 +40,82 @@ import comfy.utils
 import comfy.ops
 import comfy.model_prefetch
 import comfy.storage
+from comfy.internal_logging import detail
+
+
+def _vae_operation_diagnostics(operation, tiled=False):
+    def decorator(function):
+        @functools.wraps(function)
+        def wrapped(self, *args, **kwargs):
+            if not model_management.vae_attention_diagnostics():
+                return function(self, *args, **kwargs)
+            device = self.device
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            started = time.perf_counter()
+            event = {"type": "operation", "operation": operation, "requested_mode": model_management.vae_attention_backend(), "tiled": tiled, "automatic_fallback": False}
+            output = None
+            primary_exception = False
+            deferred_exception = None
+            try:
+                output = function(self, *args, **kwargs)
+            except Exception as e:
+                primary_exception = True
+                message = str(e).lower()
+                category = "oom" if model_management.is_oom(e) else "unsupported" if isinstance(e, NotImplementedError) or "unsupported" in message or "not supported" in message or "no available kernel" in message or "no viable backend" in message else "kernel_error"
+                event["exception"] = {"type": type(e).__name__, "message": str(e), "category": category}
+                raise
+            finally:
+                if device.type == "cuda":
+                    try:
+                        torch.cuda.synchronize(device)
+                    except Exception as deferred:
+                        deferred_exception = deferred
+                        message = str(deferred).lower()
+                        category = "oom" if model_management.is_oom(deferred) else "unsupported" if isinstance(deferred, NotImplementedError) or "unsupported" in message or "not supported" in message or "no available kernel" in message or "no viable backend" in message else "kernel_error"
+                        event["deferred_exception"] = {"type": type(deferred).__name__, "message": str(deferred), "category": category}
+                    event["peak_allocated"] = torch.cuda.max_memory_allocated(device)
+                else:
+                    event["peak_allocated"] = 0
+                event["elapsed_ms"] = (time.perf_counter() - started) * 1000
+                if torch.is_tensor(output) and deferred_exception is None:
+                    validation_started = time.perf_counter()
+                    numel = output.numel()
+                    if numel:
+                        output_min, output_max = torch.aminmax(output)
+                        nonzero = int(torch.count_nonzero(output).item())
+                        output_min = output_min.item()
+                        output_max = output_max.item()
+                        nonfinite = not math.isfinite(output_min) or not math.isfinite(output_max)
+                    else:
+                        nonzero = 0
+                        output_min = None
+                        output_max = None
+                        nonfinite = False
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    zero = numel - nonzero
+                    event["output"] = {
+                        "shape": list(output.shape),
+                        "dtype": str(output.dtype),
+                        "numel": numel,
+                        "finite": not nonfinite,
+                        "nonfinite": nonfinite,
+                        "zero": zero,
+                        "zero_fraction": zero / numel if numel else 0.0,
+                        "degenerate": bool(numel and not nonfinite and output_min == output_max),
+                        "min": output_min if not nonfinite else None,
+                        "max": output_max if not nonfinite else None,
+                    }
+                    event["validation_ms"] = (time.perf_counter() - validation_started) * 1000
+                detail("VAE_BENCH %s", json.dumps(event, separators=(",", ":"), allow_nan=False))
+                if deferred_exception is not None and not primary_exception:
+                    raise deferred_exception
+            return output
+        return wrapped
+    return decorator
+
 
 from . import clip_vision
 from . import gligen
@@ -1249,6 +1328,7 @@ class VAE:
             args["overlap_t"] = overlap_t
         return args
 
+    @_vae_operation_diagnostics("decode")
     def decode(self, samples_in, vae_options={}):
         self.throw_exception_if_invalid()
         pixel_samples = None
@@ -1286,7 +1366,11 @@ class VAE:
                     self.process_output(pixel_samples[x:x+batch_number])
             except Exception as e:
                 model_management.raise_non_oom(e)
+                if model_management.vae_attention_backend() is not None:
+                    raise
                 logging.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
+                if model_management.vae_attention_diagnostics():
+                    detail("VAE_BENCH %s", json.dumps({"type": "fallback", "operation": "decode", "requested_mode": model_management.vae_attention_backend(), "automatic": True, "from": "regular", "to": "tiled", "exception": {"type": type(e).__name__, "message": str(e)}}, separators=(",", ":"), allow_nan=False))
                 #NOTE: We don't know what tensors were allocated to stack variables at the time of the
                 #exception and the exception itself refs them all until we get out of this except block.
                 #So we just set a flag for tiler fallback so that tensor gc can happen once the
@@ -1358,6 +1442,7 @@ class VAE:
             s[-1] = min(s[-1], tile_x)
         return tuple(s)
 
+    @_vae_operation_diagnostics("decode", tiled=True)
     def decode_tiled(self, samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
         self.throw_exception_if_invalid()
         memory_used = self.memory_used_decode(self._tile_bounded_shape(samples.shape, tile_x, tile_y, tile_t), self.vae_dtype)
@@ -1390,6 +1475,7 @@ class VAE:
                 output = self.decode_tiled_3d(samples, **args)
         return output.movedim(1, -1)
 
+    @_vae_operation_diagnostics("encode")
     def encode(self, pixel_samples):
         self.throw_exception_if_invalid()
         pixel_samples = self.vae_encode_crop_pixels(pixel_samples)
@@ -1423,7 +1509,11 @@ class VAE:
 
             except Exception as e:
                 model_management.raise_non_oom(e)
+                if model_management.vae_attention_backend() is not None:
+                    raise
                 logging.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
+                if model_management.vae_attention_diagnostics():
+                    detail("VAE_BENCH %s", json.dumps({"type": "fallback", "operation": "encode", "requested_mode": model_management.vae_attention_backend(), "automatic": True, "from": "regular", "to": "tiled", "exception": {"type": type(e).__name__, "message": str(e)}}, separators=(",", ":"), allow_nan=False))
                 #NOTE: We don't know what tensors were allocated to stack variables at the time of the
                 #exception and the exception itself refs them all until we get out of this except block.
                 #So we just set a flag for tiler fallback so that tensor gc can happen once the
@@ -1448,6 +1538,7 @@ class VAE:
             samples = self.format_encoded(samples)
         return samples
 
+    @_vae_operation_diagnostics("encode", tiled=True)
     def encode_tiled(self, pixel_samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
         self.throw_exception_if_invalid()
         pixel_samples = self.vae_encode_crop_pixels(pixel_samples)

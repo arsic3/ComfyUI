@@ -100,6 +100,8 @@ fpvae_group.add_argument("--fp32-vae", action="store_true", help="Run the VAE in
 fpvae_group.add_argument("--bf16-vae", action="store_true", help="Run the VAE in bf16.")
 
 parser.add_argument("--cpu-vae", action="store_true", help="Run the VAE on the CPU.")
+parser.add_argument("--vae-attention-backend", choices=("split", "default-sdpa", "flash", "efficient", "math"), default=None, help="Override the attention backend for standard and MiniMax VAEs.")
+parser.add_argument("--vae-attention-diagnostics", action="store_true", help="Log detailed local VAE attention and operation diagnostics.")
 
 fpte_group = parser.add_mutually_exclusive_group()
 fpte_group.add_argument("--fp8_e4m3fn-text-enc", action="store_true", help="Store text encoder weights in fp8 (e4m3fn variant).")

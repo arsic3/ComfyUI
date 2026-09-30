@@ -11,6 +11,7 @@ import comfy.ops
 import comfy.quant_ops
 import comfy.rmsnorm
 from comfy.ldm.modules.attention import COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE, optimized_attention
+from comfy.ldm.modules.diffusionmodules.model import vae_attention_bhsd
 
 ops = comfy.ops.disable_weight_init
 
@@ -308,8 +309,12 @@ class Attention(nn.Module):
             key = comfy.rmsnorm.rms_norm(key, self.norm_k.weight, self.norm_k.eps)
 
         query, key, value = (t.transpose(1, 2) for t in (query, key, value))
+        backend = comfy.model_management.vae_attention_backend()
+        if backend is not None:
+            out = vae_attention_bhsd(query, key, value, backend)
+            out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         # an int8 decoder already accepts int8 numerics; fp16 keeps exact flash
-        if isinstance(self.to_qkv.weight, comfy.ops.QuantizedTensor) and COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE:
+        elif isinstance(self.to_qkv.weight, comfy.ops.QuantizedTensor) and COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE:
             out = comfy.quant_ops.ck.int8_attention(query, key, value)
             out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         else:
